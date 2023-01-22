@@ -1,17 +1,14 @@
-import { NormalizedTorrent } from '@ctrl/shared-torrent';
-import { Text, Title, Group, useMantineTheme, Box, Card, ColorSwatch, Stack } from '@mantine/core';
+import { Box, Card, Group, Stack, Text, useMantineTheme } from '@mantine/core';
 import { useListState } from '@mantine/hooks';
-import { showNotification } from '@mantine/notifications';
 import { linearGradientDef } from '@nivo/core';
-import { Datum, ResponsiveLine } from '@nivo/line';
-import { IconArrowsUpDown } from '@tabler/icons';
-import axios from 'axios';
+import { Datum, ResponsiveLine, Serie } from '@nivo/line';
+import { IconArrowsUpDown, IconDownload, IconUpload } from '@tabler/icons';
 import { useTranslation } from 'next-i18next';
-import { useEffect, useState } from 'react';
+import { useEffect } from 'react';
 import { useConfigContext } from '../../config/provider';
-import { useSetSafeInterval } from '../../hooks/useSetSafeInterval';
+import { useGetTorrentData } from '../../hooks/widgets/torrents/useGetTorrentData';
 import { humanFileSize } from '../../tools/humanFileSize';
-import { NormalizedTorrentListResponse } from '../../types/api/NormalizedTorrentListResponse';
+import { AppType } from '../../types/app';
 import { defineWidget } from '../helper';
 import { IWidget } from '../widgets';
 
@@ -38,86 +35,106 @@ interface TorrentNetworkTrafficTileProps {
 function TorrentNetworkTrafficTile({ widget }: TorrentNetworkTrafficTileProps) {
   const { t } = useTranslation(`modules/${definition.id}`);
   const { colors } = useMantineTheme();
-  const setSafeInterval = useSetSafeInterval();
-  const { configVersion, config } = useConfigContext();
+  const { config } = useConfigContext();
 
-  const [torrentHistory, torrentHistoryHandlers] = useListState<TorrentHistory>([]);
-  const [torrents, setTorrents] = useState<NormalizedTorrent[]>([]);
+  const [clientDataHistory, setClientDataHistory] = useListState<ClientDataHistory>([]);
 
-  const downloadServices =
-    config?.apps.filter(
-      (app) =>
-        app.integration.type === 'qBittorrent' ||
-        app.integration.type === 'transmission' ||
-        app.integration.type === 'deluge'
-    ) ?? [];
-  const totalDownloadSpeed = torrents.reduce((acc, torrent) => acc + torrent.downloadSpeed, 0);
-  const totalUploadSpeed = torrents.reduce((acc, torrent) => acc + torrent.uploadSpeed, 0);
+  const { data, dataUpdatedAt } = useGetTorrentData({
+    appId: widget.id,
+    refreshInterval: 1000,
+  });
 
   useEffect(() => {
-    if (downloadServices.length === 0) return;
-    const interval = setSafeInterval(() => {
-      // Send one request with each download service inside
-      axios
-        .post('/api/modules/torrents')
-        .then((response) => {
-          const responseData: NormalizedTorrentListResponse = response.data;
-          setTorrents(responseData.torrents.flatMap((x) => x.torrents));
-        })
-        .catch((error) => {
-          if (error.status === 401) return;
-          setTorrents([]);
-          // eslint-disable-next-line no-console
-          console.error('Error while fetching torrents', error.response.data);
-          showNotification({
-            title: 'Torrent speed module failed to fetch torrents',
-            autoClose: 1000,
-            disallowClose: true,
-            id: 'fail-torrent-speed-module',
-            color: 'red',
-            message:
-              'Error fetching torrents, please check your config for any potential errors, check the console for more info',
-          });
-          clearInterval(interval);
+    if (!data) {
+      return;
+    }
+
+    data.torrents.forEach((item) => {
+      const app = config?.apps.find((app) => app.id === item.appId);
+
+      if (!app) {
+        return;
+      }
+
+      const totalDownloadSpeed = item.torrents
+        .map((torrent) => torrent.downloadSpeed)
+        .reduce((accumulator, currentValue) => accumulator + currentValue);
+
+      const totalUploadSpeed = item.torrents
+        .map((torrent) => torrent.uploadSpeed)
+        .reduce((accumulator, currentValue) => accumulator + currentValue);
+
+      const entry: ClientDataEntry = {
+        download: totalDownloadSpeed,
+        upload: totalUploadSpeed,
+        x: Date.now(),
+      };
+
+      if (!clientDataHistory.some((x) => x.app === app)) {
+        setClientDataHistory.append({
+          app,
+          entries: [entry],
         });
-    }, 1000);
-  }, [configVersion]);
+        return;
+      }
+
+      setClientDataHistory.applyWhere(
+        (x) => x.app === app,
+        (client) => {
+          client.entries.push(entry);
+          return client;
+        }
+      );
+    });
+  }, [data, dataUpdatedAt]);
 
   useEffect(() => {
-    torrentHistoryHandlers.append({
-      x: Date.now(),
-      down: totalDownloadSpeed,
-      up: totalUploadSpeed,
-    });
-  }, [totalDownloadSpeed, totalUploadSpeed]);
+    clientDataHistory.forEach((client) => {
+      if (client.entries.length < 30) {
+        return;
+      }
 
-  const history = torrentHistory.slice(-10);
-  const chartDataUp = history.map((load, i) => ({
-    x: load.x,
-    y: load.up,
-  })) as Datum[];
-  const chartDataDown = history.map((load, i) => ({
-    x: load.x,
-    y: load.down,
-  })) as Datum[];
+      setClientDataHistory.applyWhere(
+        (item) => item === client,
+        (previousClient) => {
+          previousClient.entries.shift();
+          return previousClient;
+        }
+      );
+    });
+  }, [clientDataHistory]);
+
+  if (!data) {
+    return null;
+  }
+
+  const lineChartData = [
+    ...clientDataHistory.map(
+      (clientData): Serie => ({
+        id: `download_${clientData.app.id}`,
+        data: clientData.entries.map(
+          (entry): Datum => ({
+            x: entry.x,
+            y: entry.download,
+          })
+        ),
+      })
+    ),
+    ...clientDataHistory.map(
+      (clientData): Serie => ({
+        id: `upload_${clientData.app.id}`,
+        data: clientData.entries.map(
+          (entry): Datum => ({
+            x: entry.x,
+            y: entry.upload,
+          })
+        ),
+      })
+    ),
+  ];
 
   return (
     <Stack>
-      <Title order={4}>{t('card.lineChart.title')}</Title>
-      <Stack>
-        <Group>
-          <ColorSwatch size={12} color={colors.green[5]} />
-          <Text>
-            {t('card.lineChart.totalDownload', { download: humanFileSize(totalDownloadSpeed) })}
-          </Text>
-        </Group>
-        <Group>
-          <ColorSwatch size={12} color={colors.blue[5]} />
-          <Text>
-            {t('card.lineChart.totalUpload', { upload: humanFileSize(totalUploadSpeed) })}
-          </Text>
-        </Group>
-      </Stack>
       <Box
         style={{
           height: 200,
@@ -128,50 +145,93 @@ function TorrentNetworkTrafficTile({ widget }: TorrentNetworkTrafficTileProps) {
           isInteractive
           enableSlices="x"
           sliceTooltip={({ slice }) => {
-            const Download = slice.points[0].data.y as number;
-            const Upload = slice.points[1].data.y as number;
-            // Get the number of seconds since the last update.
-            const seconds = (Date.now() - (slice.points[0].data.x as number)) / 1000;
-            // Round to the nearest second.
-            const roundedSeconds = Math.round(seconds);
+            const { points } = slice;
+
+            const values: CapturedClientEntry[] = [];
+            points.forEach((point) => {
+              const pointId = String(point.serieId);
+              const isDownload = pointId.startsWith('download_');
+              const appId = pointId.split('_')[1];
+              const app = clientDataHistory.find((x) => x.app.id === appId);
+
+              if (!app) {
+                return null;
+              }
+
+              const value = Number(point.data.y);
+
+              const matchingApp = values.find((x) => x.app.id === app.app.id);
+              if (matchingApp) {
+                if (isDownload) {
+                  matchingApp.download = value;
+                } else {
+                  matchingApp.upload = value;
+                }
+              } else {
+                values.push({
+                  app: app.app,
+                  download: isDownload ? value : 0,
+                  upload: !isDownload ? value : 0,
+                });
+              }
+            });
+
             return (
-              <Card p="sm" radius="md" withBorder>
-                <Text size="md">{t('card.lineChart.timeSpan', { seconds: roundedSeconds })}</Text>
-                <Card.Section p="sm">
-                  <Stack>
-                    <Group>
-                      <ColorSwatch size={10} color={colors.green[5]} />
-                      <Text size="md">
-                        {t('card.lineChart.download', { download: humanFileSize(Download) })}
-                      </Text>
-                    </Group>
-                    <Group>
-                      <ColorSwatch size={10} color={colors.blue[5]} />
-                      <Text size="md">
-                        {t('card.lineChart.upload', { upload: humanFileSize(Upload) })}
-                      </Text>
-                    </Group>
+              <Card p="xs" radius="md" withBorder>
+                <Card.Section p="xs">
+                  <Stack spacing="xs">
+                    {values.map((value) => (
+                      <Group>
+                        {/* eslint-disable-next-line @next/next/no-img-element */}
+                        <img
+                          src={value.app.appearance.iconUrl}
+                          width={20}
+                          height={20}
+                          alt="app icon"
+                        />
+                        <Stack spacing={0}>
+                          <Text>{value.app.name}</Text>
+                          <Group>
+                            <Group spacing={3}>
+                              <IconDownload opacity={0.7} size={16} />
+                              <Text size="sm" color="dimmed">
+                                {t('card.lineChart.download', {
+                                  download: humanFileSize(value.download),
+                                })}
+                              </Text>
+                            </Group>
+
+                            <Group spacing={3}>
+                              <IconUpload opacity={0.7} size={16} />
+                              <Text size="sm" color="dimmed">
+                                {t('card.lineChart.upload', {
+                                  upload: humanFileSize(value.upload),
+                                })}
+                              </Text>
+                            </Group>
+                          </Group>
+                        </Stack>
+                      </Group>
+                    ))}
                   </Stack>
                 </Card.Section>
               </Card>
             );
           }}
-          data={[
-            {
-              id: 'downloads',
-              data: chartDataUp,
-            },
-            {
-              id: 'uploads',
-              data: chartDataDown,
-            },
-          ]}
+          data={lineChartData}
           curve="monotoneX"
           yFormat=" >-.2f"
-          axisTop={null}
+          axisLeft={{
+            tickSize: 5,
+            legend: 'Speed',
+            tickPadding: 5,
+            tickRotation: 0,
+            legendOffset: 12,
+            legendPosition: 'middle',
+          }}
+          axisBottom={null}
           axisRight={null}
           enablePoints={false}
-          animate={false}
           enableGridX={false}
           enableGridY={false}
           enableArea
@@ -182,7 +242,8 @@ function TorrentNetworkTrafficTile({ widget }: TorrentNetworkTrafficTileProps) {
             ]),
           ]}
           fill={[{ match: '*', id: 'gradientA' }]}
-          colors={[colors.blue[5], colors.green[5]]}
+          margin={{ left: 50, bottom: 5 }}
+          animate={false}
         />
       </Box>
     </Stack>
@@ -191,8 +252,19 @@ function TorrentNetworkTrafficTile({ widget }: TorrentNetworkTrafficTileProps) {
 
 export default definition;
 
-interface TorrentHistory {
+interface ClientDataHistory {
+  app: AppType;
+  entries: ClientDataEntry[];
+}
+
+interface ClientDataEntry {
   x: number;
-  up: number;
-  down: number;
+  upload: number;
+  download: number;
+}
+
+interface CapturedClientEntry {
+  app: AppType;
+  upload: number;
+  download: number;
 }

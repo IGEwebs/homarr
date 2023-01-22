@@ -78,6 +78,9 @@ function TorrentTile({ widget }: TorrentTileProps) {
     [];
 
   const [selectedAppId, setSelectedApp] = useState<string | null>(downloadApps[0]?.id);
+
+  console.log(`Using refresh interval of ${widget.properties.refreshInterval * 1000}ms for torrent widget`);
+
   const {
     data,
     isError,
